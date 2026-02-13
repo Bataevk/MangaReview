@@ -27,13 +27,14 @@ except Exception:  # pragma: no cover - installed in container via _PIP_ADDITION
 
 REMANGA_TOP_URL = "https://api.remanga.org/api/v2/titles/top/"
 DEFAULT_PERIODS = ("new", "monthly", "year")
+DEFAULT_SECTIONS = ("new", "manga", "manhwa", "manhua", "comics")
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _stable_item_key(period: str, item: Any) -> str:
+def _stable_item_key(period: str, section: str, item: Any) -> str:
     """
     Возвращает стабильный ключ элемента для ODS.
     Предпочитаем числовой id, иначе строим хэш по JSON-представлению.
@@ -42,9 +43,10 @@ def _stable_item_key(period: str, item: Any) -> str:
         for k in ("id", "title_id", "pk", "slug"):
             v = item.get(k)
             if v is not None and v != "":
-                return str(v)
+                # IMPORTANT: keep uniqueness across sections
+                return f"{section}:{v}"
     raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(f"{period}:{raw}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{period}:{section}:{raw}".encode("utf-8")).hexdigest()
 
 
 def _pick(d: Dict[str, Any], keys: Iterable[str]) -> Any:
@@ -58,7 +60,7 @@ def _extract_items(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for k in ("results", "items", "content", "data"):
+        for k in ("titles", "results", "items", "content", "data"):
             v = payload.get(k)
             if isinstance(v, list):
                 return [x for x in v if isinstance(x, dict)]
@@ -74,6 +76,7 @@ def fetch_remanga_top(
     timeout_seconds: int = 30,
     max_retries: int = 5,
     backoff_seconds: float = 0.5,
+    sleep_seconds: float = 0.2,
 ) -> Dict[str, Any]:
     """
     Extract: забирает JSON ReManga API (top titles).
@@ -90,7 +93,10 @@ def fetch_remanga_top(
         "section": section,
         "tag": tag,
     }
-    headers = {"User-Agent": "airflow-remanga-ods/1.0"}
+    headers = {
+        "User-Agent": "airflow-remanga-ods/1.0",
+        "Accept": "application/json",
+    }
 
     last_exc: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
@@ -107,8 +113,14 @@ def fetch_remanga_top(
                 time.sleep(sleep_for)
                 continue
             resp.raise_for_status()
+            if sleep_seconds and sleep_seconds > 0:
+                time.sleep(sleep_seconds)
             return {
                 "period": period,
+                "section": section,
+                "tag": tag,
+                "page": page,
+                "count": count,
                 "fetched_at": _now_utc().isoformat(),
                 "url": resp.url,
                 "payload": resp.json(),
@@ -140,6 +152,43 @@ def extract_all_periods(
     return out
 
 
+def extract_top_titles(
+    periods: Tuple[str, ...] = DEFAULT_PERIODS,
+    sections: Tuple[str, ...] = DEFAULT_SECTIONS,
+    tag: str = "all",
+    count: int = 20,
+    pages: int = 5,
+    sleep_seconds: float = 0.2,
+) -> List[Dict[str, Any]]:
+    """
+    Extract: вытаскивает топы по матрице (period x section x page).
+
+    Требование "минимум 100 элементов" выполняется как pages=5, count=20 (API капает 20).
+    """
+    out: List[Dict[str, Any]] = []
+    for section in sections:
+        for period in periods:
+            for page in range(1, pages + 1):
+                out.append(
+                    fetch_remanga_top(
+                        period=period,
+                        section=section,
+                        tag=tag,
+                        page=page,
+                        count=count,
+                        sleep_seconds=sleep_seconds,
+                    )
+                )
+    logging.info(
+        "Fetched %d payloads (sections=%d, periods=%d, pages=%d)",
+        len(out),
+        len(sections),
+        len(periods),
+        pages,
+    )
+    return out
+
+
 def transform_to_rows(extracted: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Transform: минимальная нормализация + сохранение raw JSON.
@@ -148,13 +197,20 @@ def transform_to_rows(extracted: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for entry in extracted:
         period = entry.get("period")
+        section = entry.get("section") or "unknown"
+        page = entry.get("page")
+        count = entry.get("count")
+        tag = entry.get("tag")
         fetched_at = entry.get("fetched_at")
         url = entry.get("url")
         payload = entry.get("payload")
 
         items = _extract_items(payload)
         for idx, item in enumerate(items, start=1):
-            item_key = _stable_item_key(str(period), item)
+            page_int = int(page) if page is not None else 1
+            count_int = int(count) if count is not None else 20
+            global_rank = (page_int - 1) * count_int + idx
+            item_key = _stable_item_key(str(period), str(section), item)
             title_id = None
             title_name = None
             rating = None
@@ -166,8 +222,11 @@ def transform_to_rows(extracted: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             rows.append(
                 {
                     "period": str(period),
+                    "section": str(section),
+                    "tag": str(tag) if tag is not None else None,
                     "item_key": str(item_key),
-                    "rank": idx,
+                    "page": page_int,
+                    "rank": global_rank,
                     "title_id": title_id,
                     "title_name": title_name,
                     "rating": rating,
@@ -196,7 +255,10 @@ def load_rows_to_postgres(rows: List[Dict[str, Any]], postgres_conn_id: str = "p
         """
         CREATE TABLE IF NOT EXISTS ods_remanga_titles_top_pg (
             period TEXT NOT NULL,
+            section TEXT NULL,
+            tag TEXT NULL,
             item_key TEXT NOT NULL,
+            page INT,
             rank INT,
             title_id BIGINT NULL,
             title_name TEXT NULL,
@@ -209,13 +271,21 @@ def load_rows_to_postgres(rows: List[Dict[str, Any]], postgres_conn_id: str = "p
         """
     )
 
+    # Backward/forward compatible schema evolution
+    cur.execute("ALTER TABLE ods_remanga_titles_top_pg ADD COLUMN IF NOT EXISTS section TEXT;")
+    cur.execute("ALTER TABLE ods_remanga_titles_top_pg ADD COLUMN IF NOT EXISTS tag TEXT;")
+    cur.execute("ALTER TABLE ods_remanga_titles_top_pg ADD COLUMN IF NOT EXISTS page INT;")
+
     insert_sql = """
         INSERT INTO ods_remanga_titles_top_pg
-            (period, item_key, rank, title_id, title_name, rating, fetched_at, source_url, raw)
+            (period, section, tag, item_key, page, rank, title_id, title_name, rating, fetched_at, source_url, raw)
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
         ON CONFLICT (period, item_key) DO UPDATE
-        SET rank = EXCLUDED.rank,
+        SET section = EXCLUDED.section,
+            tag = EXCLUDED.tag,
+            page = EXCLUDED.page,
+            rank = EXCLUDED.rank,
             title_id = EXCLUDED.title_id,
             title_name = EXCLUDED.title_name,
             rating = EXCLUDED.rating,
@@ -229,7 +299,10 @@ def load_rows_to_postgres(rows: List[Dict[str, Any]], postgres_conn_id: str = "p
             insert_sql,
             (
                 r["period"],
+                r.get("section"),
+                r.get("tag"),
                 r["item_key"],
+                r.get("page"),
                 r.get("rank"),
                 r.get("title_id"),
                 r.get("title_name"),
@@ -328,9 +401,11 @@ def upload_extracted_to_minio(
     uploaded: List[str] = []
     for entry in extracted:
         period = str(entry.get("period"))
+        section = str(entry.get("section") or "unknown")
+        page = str(entry.get("page") or "1")
         fetched_at = str(entry.get("fetched_at") or _now_utc().isoformat())
         safe_ts = fetched_at.replace(":", "").replace("+", "").replace("-", "")
-        key = f"{object_prefix}/period={period}/fetched_at={safe_ts}.json"
+        key = f"{object_prefix}/section={section}/period={period}/page={page}/fetched_at={safe_ts}.json"
 
         body_obj = dict(entry)
         if not include_raw_payload:

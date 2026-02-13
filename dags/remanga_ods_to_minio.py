@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from remanga_ods_utils import extract_all_periods, upload_extracted_to_minio
+from remanga_ods_utils import extract_top_titles, upload_extracted_to_minio
 
 
 default_args = {
@@ -15,7 +15,14 @@ default_args = {
 
 
 def _extract(**_context):
-    return extract_all_periods(periods=("new", "monthly", "year"), count=20, page=1, section="new", tag="all")
+    return extract_top_titles(
+        periods=("new", "monthly", "year"),
+        sections=("new", "manga", "manhwa", "manhua", "comics"),
+        tag="all",
+        count=20,
+        pages=5,
+        sleep_seconds=0.2,
+    )
 
 
 def _upload(**context):

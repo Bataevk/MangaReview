@@ -9,6 +9,10 @@ ReManga public API:
 - `https://api.remanga.org/api/v2/titles/top/?count=20&page=1&period=monthly&section=new&tag=all`
 - `https://api.remanga.org/api/v2/titles/top/?count=20&page=1&period=year&section=new&tag=all`
 
+В текущей реализации ETL дополнительно используется несколько **разделов** (`section`):
+`new`, `manga`, `manhwa`, `manhua`, `comics`, и включена пагинация до **минимум 100 элементов**
+на каждый `(period, section)` (5 страниц × 20 элементов).
+
 ## Что реализовано (ЛР1)
 
 - **Airflow в Docker**: `docker-compose.yaml` (CeleryExecutor).
