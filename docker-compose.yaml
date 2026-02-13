@@ -1,0 +1,224 @@
+---
+# Airflow + ETL for ReManga API (Lab 1)
+# Based on official Apache Airflow docker-compose (CeleryExecutor) and BDST example.
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.1}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+
+    # Airflow connections for ODS storages (Lab 1)
+    # Postgres ODS
+    AIRFLOW_CONN_POSTGRES_ODS: postgresql+psycopg2://airflow:airflow@postgres_ods:5432/ods_manga
+    # Mongo ODS (used via BaseHook in DAGs)
+    AIRFLOW_CONN_MONGO_ODS: mongodb://mongo_ods:27017
+
+    # MinIO (S3 compatible) credentials for DAGs
+    # (intentionally duplicated in env for simplicity; can be moved to Airflow Variables)
+    REMANGA_MINIO_ENDPOINT: ${REMANGA_MINIO_ENDPOINT:-http://minio:9000}
+    REMANGA_MINIO_ACCESS_KEY: ${REMANGA_MINIO_ACCESS_KEY:-minioadmin}
+    REMANGA_MINIO_SECRET_KEY: ${REMANGA_MINIO_SECRET_KEY:-minioadmin}
+    REMANGA_MINIO_BUCKET: ${REMANGA_MINIO_BUCKET:-ods-remanga}
+
+    # Extra Python deps (dev/education). For production prefer custom image.
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-apache-airflow-providers-mongo apache-airflow-providers-amazon boto3 pymongo}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/include:/opt/airflow/include
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:latest
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD set AIRFLOW_UID, otherwise files may be owned by root."
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/config /sources/include
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,config,include}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+
+  # --- ODS storages (Lab 1) ---
+  postgres_ods:
+    image: postgres:15
+    container_name: postgres_ods
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: ods_manga
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_ods_data:/var/lib/postgresql/data
+
+  mongo_ods:
+    image: mongo:6
+    container_name: mongo_ods
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_ods_data:/data/db
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${REMANGA_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${REMANGA_MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  # Create bucket on startup (idempotent)
+  minio-init:
+    image: minio/mc:RELEASE.2024-12-18T13-17-33Z
+    depends_on:
+      - minio
+    environment:
+      REMANGA_MINIO_ENDPOINT: ${REMANGA_MINIO_ENDPOINT:-http://minio:9000}
+      REMANGA_MINIO_ACCESS_KEY: ${REMANGA_MINIO_ACCESS_KEY:-minioadmin}
+      REMANGA_MINIO_SECRET_KEY: ${REMANGA_MINIO_SECRET_KEY:-minioadmin}
+      REMANGA_MINIO_BUCKET: ${REMANGA_MINIO_BUCKET:-ods-remanga}
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      mc alias set remanga $$REMANGA_MINIO_ENDPOINT $$REMANGA_MINIO_ACCESS_KEY $$REMANGA_MINIO_SECRET_KEY &&
+      mc mb -p remanga/$$REMANGA_MINIO_BUCKET || true
+      "
+    restart: "no"
+
+volumes:
+  postgres-db-volume:
+  postgres_ods_data:
+  mongo_ods_data:
+  minio_data:
+
