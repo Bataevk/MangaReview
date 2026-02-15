@@ -77,6 +77,7 @@ def fetch_remanga_top(
     max_retries: int = 5,
     backoff_seconds: float = 0.5,
     sleep_seconds: float = 0.2,
+    batch_fetched_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract: забирает JSON ReManga API (top titles).
@@ -121,7 +122,7 @@ def fetch_remanga_top(
                 "tag": tag,
                 "page": page,
                 "count": count,
-                "fetched_at": _now_utc().isoformat(),
+                "fetched_at": batch_fetched_at or _now_utc().isoformat(),
                 "url": resp.url,
                 "payload": resp.json(),
             }
@@ -166,6 +167,7 @@ def extract_top_titles(
     Требование "минимум 100 элементов" выполняется как pages=5, count=20 (API капает 20).
     """
     out: List[Dict[str, Any]] = []
+    batch_ts = _now_utc().isoformat()
     for section in sections:
         for period in periods:
             for page in range(1, pages + 1):
@@ -177,6 +179,7 @@ def extract_top_titles(
                         page=page,
                         count=count,
                         sleep_seconds=sleep_seconds,
+                        batch_fetched_at=batch_ts,
                     )
                 )
     logging.info(

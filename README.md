@@ -58,3 +58,12 @@ docker compose up -d
 ## Отчёт
 
 См. `reports/Лаба 1. MangaReview.md`.
+
+## Лабораторная работа №2 (DDS + Data Quality)
+
+Реализованы DAG для слоя DDS в PostgreSQL:
+
+- `remanga_dds_dimensions_postgres` — измерения (в т.ч. `dim_title_scd2` как SCD2) + жанры.
+- `remanga_dds_facts_postgres` — факт “снимок топа” из ODS.
+- `remanga_dds_data_quality_postgres` — проверки качества данных (объёмы, NULL/диапазоны, согласованность ODS↔DDS).
+
